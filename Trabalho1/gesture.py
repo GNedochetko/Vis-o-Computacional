@@ -1,123 +1,91 @@
-import os
-from pathlib import Path
-import shutil
-import subprocess
 import time
+from dataclasses import dataclass
+from typing import Optional
 
 import cv2
 import numpy as np
 
-
-ROI_TOP_LEFT = (160, 120)
-ROI_BOTTOM_RIGHT = (480, 360)
-MAX_CORNERS = 80
-MIN_TRACKED_POINTS = 6
-GESTURE_THRESHOLD = 90
-COMMAND_COOLDOWN_SECONDS = 1.0
+try:
+    import pyautogui
+except ImportError:
+    pyautogui = None
 
 
-def _configure_opencv_display():
-    # No GNOME/Wayland, o OpenCV do pip costuma abrir janelas via plugin Qt xcb.
-    # Forcamos o uso do XWayland e tentamos localizar o arquivo de autorizacao correto.
-    os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
+FEATURE_PARAMS = {
+    "maxCorners": 80,
+    "qualityLevel": 0.2,
+    "minDistance": 7,
+    "blockSize": 7,
+}
 
-    xauthority = os.environ.get("XAUTHORITY")
-    if xauthority and Path(xauthority).exists():
-        return
-
-    runtime_dir = Path(f"/run/user/{os.getuid()}")
-    candidates = sorted(runtime_dir.glob(".mutter-Xwaylandauth.*"))
-    if candidates:
-        os.environ["XAUTHORITY"] = str(candidates[0])
-
-
-def _get_ydotool_socket_path():
-    return os.environ.get("YDOTOOL_SOCKET", f"/run/user/{os.getuid()}/.ydotool_socket")
-
-
-def _ensure_ydotool_available():
-    ydotool_path = shutil.which("ydotool")
-    if ydotool_path is None:
-        raise RuntimeError(
-            "O comando 'ydotool' nao esta instalado. "
-            "Instale o ydotool e inicie o daemon 'ydotoold' para enviar teclas no Wayland."
-        )
-    return ydotool_path
+LK_PARAMS = {
+    "winSize": (21, 21),
+    "maxLevel": 3,
+    "criteria": (
+        cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
+        20,
+        0.03,
+    ),
+}
 
 
-def _send_slide_key(direction):
-    key_code = "106" if direction == "right" else "105"
-    socket_path = _get_ydotool_socket_path()
-    command_env = os.environ.copy()
-    command_env["YDOTOOL_SOCKET"] = socket_path
-    key_name = "Right" if direction == "right" else "Left"
-
-    # O ydotool injeta eventos de teclado via uinput e depende do daemon ydotoold.
-    try:
-        subprocess.run(
-            ["ydotool", "key", f"{key_code}:1", f"{key_code}:0"],
-            check=True,
-            capture_output=True,
-            text=True,
-            env=command_env,
-        )
-        print(f"[gesture] tecla enviada: {key_name}")
-    except subprocess.CalledProcessError as error:
-        error_message = error.stderr.strip() or error.stdout.strip() or str(error)
-        raise RuntimeError(
-            "O ydotool falhou ao enviar a tecla para o slide. "
-            f"Erro original: {error_message}"
-        ) from error
+@dataclass
+class GestureState:
+    tracking_started: bool = False
+    previous_gray: Optional[np.ndarray] = None
+    tracked_points: Optional[np.ndarray] = None
+    cumulative_dx: float = 0.0
+    last_command_time: float = 0.0
 
 
-def _select_points(gray_frame, top_left, bottom_right):
-    x1, y1 = top_left
-    x2, y2 = bottom_right
+def _central_roi(frame_shape, scale=0.35):
+    height, width = frame_shape[:2]
+    roi_width = int(width * scale)
+    roi_height = int(height * scale)
+    x1 = (width - roi_width) // 2
+    y1 = (height - roi_height) // 2
+    x2 = x1 + roi_width
+    y2 = y1 + roi_height
+    return x1, y1, x2, y2
 
-    roi = gray_frame[y1:y2, x1:x2]
-    roi_points = cv2.goodFeaturesToTrack(
-        roi,
-        maxCorners=MAX_CORNERS,
-        qualityLevel=0.2,
-        minDistance=7,
-        blockSize=7,
-    )
 
-    if roi_points is None:
+def _detect_points(gray_frame, roi):
+    x1, y1, x2, y2 = roi
+    roi_gray = gray_frame[y1:y2, x1:x2]
+    corners = cv2.goodFeaturesToTrack(roi_gray, mask=None, **FEATURE_PARAMS)
+
+    if corners is None:
         return None
 
-    # Os pontos sao detectados na ROI e depois convertidos para coordenadas da imagem.
-    roi_points[:, 0, 0] += x1
-    roi_points[:, 0, 1] += y1
-    return roi_points
+    # Ajusta os pontos do recorte para o sistema de coordenadas do frame inteiro.
+    corners[:, 0, 0] += x1
+    corners[:, 0, 1] += y1
+    return corners
 
 
-def _draw_interface(frame, tracking_active, tracked_points, accumulated_dx):
-    cv2.rectangle(frame, ROI_TOP_LEFT, ROI_BOTTOM_RIGHT, (0, 255, 0), 2)
-    cv2.putText(
-        frame,
-        "Posicione a mao na area verde e pressione S para iniciar",
-        (20, 35),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.65,
-        (0, 255, 0),
-        2,
-    )
-    cv2.putText(
-        frame,
-        "Pressione R para recalibrar ou Q para sair",
-        (20, 65),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.65,
-        (0, 255, 255),
-        2,
-    )
+def _initialize_tracking(gray_frame, state):
+    roi = _central_roi(gray_frame.shape)
+    tracked_points = _detect_points(gray_frame, roi)
 
-    status_text = "Rastreamento ativo" if tracking_active else "Rastreamento parado"
+    if tracked_points is None or len(tracked_points) < 8:
+        return False
+
+    state.tracking_started = True
+    state.previous_gray = gray_frame
+    state.tracked_points = tracked_points
+    state.cumulative_dx = 0.0
+    return True
+
+
+def _draw_overlay(frame, state, status_message):
+    x1, y1, x2, y2 = _central_roi(frame.shape)
+    color = (0, 255, 0) if state.tracking_started else (0, 255, 255)
+    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
     cv2.putText(
         frame,
-        status_text,
-        (20, 95),
+        "S: iniciar  R: recalibrar  Q: sair",
+        (20, 30),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.7,
         (255, 255, 255),
@@ -125,181 +93,132 @@ def _draw_interface(frame, tracking_active, tracked_points, accumulated_dx):
     )
     cv2.putText(
         frame,
-        f"Pontos rastreados: {tracked_points}",
-        (20, 125),
+        status_message,
+        (20, 60),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.7,
-        (255, 255, 255),
-        2,
-    )
-    cv2.putText(
-        frame,
-        f"Deslocamento horizontal: {accumulated_dx:.1f}",
-        (20, 155),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.7,
-        (255, 255, 255),
+        color,
         2,
     )
 
+    if state.tracking_started and state.tracked_points is not None:
+        for point in state.tracked_points.reshape(-1, 2):
+            cv2.circle(frame, tuple(np.int32(point)), 3, (255, 0, 0), -1)
 
-def _reset_tracking_state():
-    return None, None, 0.0, False
+
+def _send_slide_command(direction, state, cooldown_seconds):
+    current_time = time.time()
+    if current_time - state.last_command_time < cooldown_seconds:
+        return
+
+    if direction == "right":
+        pyautogui.press("right")
+    else:
+        pyautogui.press("left")
+
+    state.last_command_time = current_time
+    state.cumulative_dx = 0.0
 
 
-def start_gesture_interface(camera_index=0):
-    _configure_opencv_display()
-    _ensure_ydotool_available()
+def _update_tracking(gray_frame, state, movement_threshold, cooldown_seconds):
+    next_points, status, _ = cv2.calcOpticalFlowPyrLK(
+        state.previous_gray,
+        gray_frame,
+        state.tracked_points,
+        None,
+        **LK_PARAMS,
+    )
+
+    if next_points is None or status is None:
+        state.tracking_started = False
+        state.tracked_points = None
+        state.previous_gray = gray_frame
+        return "Rastreamento perdido. Pressione S para iniciar novamente."
+
+    valid_new = next_points[status.flatten() == 1]
+    valid_old = state.tracked_points[status.flatten() == 1]
+
+    if len(valid_new) < 6:
+        state.tracking_started = False
+        state.tracked_points = None
+        state.previous_gray = gray_frame
+        return "Poucos pontos encontrados. Reposicione a mao e pressione S."
+
+    # Usa a mediana para reduzir o impacto de pontos ruidosos ou fora da mao.
+    horizontal_displacement = np.median(valid_new[:, 0] - valid_old[:, 0])
+    state.cumulative_dx += float(horizontal_displacement)
+
+    if state.cumulative_dx >= movement_threshold:
+        _send_slide_command("right", state, cooldown_seconds)
+        status_message = "Gesto para direita detectado. Slide avancado."
+    elif state.cumulative_dx <= -movement_threshold:
+        _send_slide_command("left", state, cooldown_seconds)
+        status_message = "Gesto para esquerda detectado. Slide retrocedido."
+    else:
+        status_message = "Rastreando mao..."
+
+    state.previous_gray = gray_frame
+    state.tracked_points = valid_new.reshape(-1, 1, 2)
+    return status_message
+
+
+def start_gesture_interface(
+    camera_index=0,
+    movement_threshold=45,
+    cooldown_seconds=1.0,
+):
+    if pyautogui is None:
+        raise RuntimeError(
+            "A biblioteca pyautogui nao esta instalada. "
+            "Instale as dependencias com 'pip install -r requirements.txt'."
+        )
+
+    # Desabilita o fail-safe para nao interromper a apresentacao ao tocar
+    # acidentalmente os cantos da tela com o mouse.
+    pyautogui.FAILSAFE = False
+    pyautogui.PAUSE = 0
 
     capture = cv2.VideoCapture(camera_index)
     if not capture.isOpened():
         raise RuntimeError("Nao foi possivel acessar a webcam.")
 
-    previous_gray = None
-    tracked_points, previous_points, accumulated_dx, tracking_active = (
-        _reset_tracking_state()
-    )
-    last_command_time = 0.0
-    feedback_message = "Pressione S para detectar pontos na mao"
-    feedback_color = (255, 255, 255)
+    state = GestureState()
+    status_message = "Posicione a mao na area central e pressione S."
 
     try:
         while True:
             success, frame = capture.read()
             if not success:
-                raise RuntimeError("Nao foi possivel capturar um frame da webcam.")
+                raise RuntimeError("Falha ao capturar frame da webcam.")
 
             frame = cv2.flip(frame, 1)
             gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-            if tracking_active and previous_gray is not None and previous_points is not None:
-                next_points, status, _ = cv2.calcOpticalFlowPyrLK(
-                    previous_gray,
+            if state.tracking_started and state.tracked_points is not None:
+                status_message = _update_tracking(
                     gray_frame,
-                    previous_points,
-                    None,
-                    winSize=(21, 21),
-                    maxLevel=3,
-                    criteria=(
-                        cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
-                        30,
-                        0.01,
-                    ),
+                    state,
+                    movement_threshold,
+                    cooldown_seconds,
                 )
 
-                if next_points is None or status is None:
-                    tracked_points, previous_points, accumulated_dx, tracking_active = (
-                        _reset_tracking_state()
-                    )
-                else:
-                    good_new = next_points[status.flatten() == 1]
-                    good_old = previous_points[status.flatten() == 1]
-
-                    if len(good_new) < MIN_TRACKED_POINTS:
-                        tracked_points, previous_points, accumulated_dx, tracking_active = (
-                            _reset_tracking_state()
-                        )
-                    else:
-                        # A media do deslocamento horizontal dos pontos indica a direcao do gesto.
-                        delta_x = np.mean(good_new[:, 0] - good_old[:, 0])
-                        accumulated_dx += float(delta_x)
-
-                        for point in good_new:
-                            x, y = point.ravel()
-                            cv2.circle(frame, (int(x), int(y)), 3, (0, 0, 255), -1)
-
-                        current_time = time.time()
-                        if (
-                            accumulated_dx >= GESTURE_THRESHOLD
-                            and current_time - last_command_time >= COMMAND_COOLDOWN_SECONDS
-                        ):
-                            _send_slide_key("right")
-                            last_command_time = current_time
-                            accumulated_dx = 0.0
-                            feedback_message = "Gesto para a direita detectado"
-                            feedback_color = (0, 255, 0)
-                            cv2.putText(
-                                frame,
-                                "Slide seguinte",
-                                (20, 190),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                0.8,
-                                (0, 255, 0),
-                                2,
-                            )
-                        elif (
-                            accumulated_dx <= -GESTURE_THRESHOLD
-                            and current_time - last_command_time >= COMMAND_COOLDOWN_SECONDS
-                        ):
-                            _send_slide_key("left")
-                            last_command_time = current_time
-                            accumulated_dx = 0.0
-                            feedback_message = "Gesto para a esquerda detectado"
-                            feedback_color = (0, 255, 0)
-                            cv2.putText(
-                                frame,
-                                "Slide anterior",
-                                (20, 190),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                0.8,
-                                (0, 255, 0),
-                                2,
-                            )
-
-                        previous_points = good_new.reshape(-1, 1, 2)
-                        tracked_points = len(good_new)
-
-            if tracked_points is None:
-                tracked_points = 0
-
-            _draw_interface(frame, tracking_active, tracked_points, accumulated_dx)
-            cv2.putText(
-                frame,
-                feedback_message,
-                (20, 220),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                feedback_color,
-                2,
-            )
-            cv2.imshow("Interface Gestual", frame)
+            _draw_overlay(frame, state, status_message)
+            cv2.imshow("Controle de Slides por Gestos", frame)
 
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
                 break
             if key == ord("r"):
-                tracked_points, previous_points, accumulated_dx, tracking_active = (
-                    _reset_tracking_state()
-                )
-                previous_gray = None
-                feedback_message = "Rastreamento reiniciado"
-                feedback_color = (0, 255, 255)
+                state = GestureState()
+                status_message = "Calibracao reiniciada. Posicione a mao e pressione S."
             if key == ord("s"):
-                selected_points = _select_points(
-                    gray_frame,
-                    ROI_TOP_LEFT,
-                    ROI_BOTTOM_RIGHT,
-                )
-
-                if selected_points is not None and len(selected_points) >= MIN_TRACKED_POINTS:
-                    previous_points = selected_points.astype(np.float32)
-                    tracking_active = True
-                    accumulated_dx = 0.0
-                    tracked_points = len(previous_points)
-                    previous_gray = gray_frame.copy()
-                    feedback_message = f"Rastreamento iniciado com {tracked_points} pontos"
-                    feedback_color = (0, 255, 0)
+                if _initialize_tracking(gray_frame, state):
+                    status_message = "Rastreamento iniciado. Mova a mao horizontalmente."
                 else:
-                    tracking_active = False
-                    tracked_points = 0
-                    feedback_message = (
-                        "Nao foi possivel detectar pontos suficientes na area verde"
+                    status_message = (
+                        "Nao foi possivel detectar pontos suficientes. "
+                        "Aproxime a mao e tente novamente."
                     )
-                    feedback_color = (0, 0, 255)
-
-            if tracking_active:
-                previous_gray = gray_frame.copy()
-
     finally:
         capture.release()
         cv2.destroyAllWindows()
