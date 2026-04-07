@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import cv2
+import numpy as np
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -16,6 +17,11 @@ def _find_image_path(base_name):
     return None
 
 
+def _read_image(image_path):
+    file_bytes = np.frombuffer(image_path.read_bytes(), dtype=np.uint8)
+    return cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+
+
 def load_fixed_images():
     image1_path = _find_image_path("img1")
     image2_path = _find_image_path("img2")
@@ -26,8 +32,8 @@ def load_fixed_images():
             "Use nomes como img1.jpg e img2.jpg."
         )
 
-    image1 = cv2.imread(str(image1_path))
-    image2 = cv2.imread(str(image2_path))
+    image1 = _read_image(image1_path)
+    image2 = _read_image(image2_path)
 
     if image1 is None or image2 is None:
         raise ValueError("OpenCV nao conseguiu carregar uma das imagens.")

@@ -12,32 +12,32 @@ except ImportError:
 
 
 FEATURE_PARAMS = {
-    "maxCorners": 80,
-    "qualityLevel": 0.2,
-    "minDistance": 7,
-    "blockSize": 7,
+    "maxCorners": 80,      # numero maximo de cantos
+    "qualityLevel": 0.2,   # qualidade minima aceita
+    "minDistance": 7,      # distancia minima entre pontos
+    "blockSize": 7,        # tamanho da vizinhanca analisada
 }
 
 LK_PARAMS = {
-    "winSize": (21, 21),
-    "maxLevel": 3,
+    "winSize": (21, 21),   # tamanho da janela de busca
+    "maxLevel": 3,         # niveis da piramide
     "criteria": (
         cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
-        20,
-        0.03,
+        20,                # maximo de iteracoes
+        0.03,              # tolerancia de erro
     ),
 }
 
-
 @dataclass
 class GestureState:
-    tracking_started: bool = False
-    previous_gray: Optional[np.ndarray] = None
-    tracked_points: Optional[np.ndarray] = None
-    cumulative_dx: float = 0.0
-    last_command_time: float = 0.0
+    tracking_started: bool = False              # indica se o rastreio iniciou
+    previous_gray: Optional[np.ndarray] = None  # frame anterior em cinza
+    tracked_points: Optional[np.ndarray] = None # pontos atualmente rastreados
+    cumulative_dx: float = 0.0                  # deslocamento horizontal acumulado
+    last_command_time: float = 0.0              # instante do ultimo comando
 
 
+# Calcula a regiao central onde a mao deve ser posicionada.
 def _central_roi(frame_shape, scale=0.35):
     height, width = frame_shape[:2]
     roi_width = int(width * scale)
@@ -49,6 +49,7 @@ def _central_roi(frame_shape, scale=0.35):
     return x1, y1, x2, y2
 
 
+# Detecta pontos de interesse dentro da regiao central.
 def _detect_points(gray_frame, roi):
     x1, y1, x2, y2 = roi
     roi_gray = gray_frame[y1:y2, x1:x2]
@@ -63,6 +64,7 @@ def _detect_points(gray_frame, roi):
     return corners
 
 
+# Inicializa o rastreamento com os pontos detectados.
 def _initialize_tracking(gray_frame, state):
     roi = _central_roi(gray_frame.shape)
     tracked_points = _detect_points(gray_frame, roi)
@@ -77,6 +79,7 @@ def _initialize_tracking(gray_frame, state):
     return True
 
 
+# Desenha a interface visual e os pontos rastreados no frame.
 def _draw_overlay(frame, state, status_message):
     x1, y1, x2, y2 = _central_roi(frame.shape)
     color = (0, 255, 0) if state.tracking_started else (0, 255, 255)
@@ -106,6 +109,7 @@ def _draw_overlay(frame, state, status_message):
             cv2.circle(frame, tuple(np.int32(point)), 3, (255, 0, 0), -1)
 
 
+# Envia o comando do slide respeitando o tempo de espera.
 def _send_slide_command(direction, state, cooldown_seconds):
     current_time = time.time()
     if current_time - state.last_command_time < cooldown_seconds:
@@ -120,6 +124,7 @@ def _send_slide_command(direction, state, cooldown_seconds):
     state.cumulative_dx = 0.0
 
 
+# Atualiza os pontos rastreados e detecta o gesto horizontal.
 def _update_tracking(gray_frame, state, movement_threshold, cooldown_seconds):
     next_points, status, _ = cv2.calcOpticalFlowPyrLK(
         state.previous_gray,
@@ -162,6 +167,7 @@ def _update_tracking(gray_frame, state, movement_threshold, cooldown_seconds):
     return status_message
 
 
+# Inicia a captura da webcam e o controle de slides por gestos.
 def start_gesture_interface(
     camera_index=0,
     movement_threshold=45,

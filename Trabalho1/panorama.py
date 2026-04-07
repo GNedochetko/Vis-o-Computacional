@@ -258,6 +258,10 @@ def save_panorama(panorama, file_name):
     results_dir.mkdir(exist_ok=True)
 
     output_path = results_dir / file_name
-    cv2.imwrite(str(output_path), panorama)
+    success, encoded_image = cv2.imencode(output_path.suffix, panorama)
+    if not success:
+        raise ValueError("OpenCV nao conseguiu codificar a panoramica para salvar.")
+
+    output_path.write_bytes(encoded_image.tobytes())
 
     return output_path
